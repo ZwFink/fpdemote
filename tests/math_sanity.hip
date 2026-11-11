@@ -1,4 +1,4 @@
-// Sanity check for demote-fp-math: evaluates each math function in a JIT
+// Sanity check for the math part of demote-fp: evaluates each math function in a JIT
 // compiled kernel and reports its maximum error against the host's double
 // result. Demoted functions should show float-level error (about 1e-7) and
 // functions the pass keeps in double should show double-level error.
@@ -112,7 +112,7 @@ int main() {
                         : MaxErr < 1e-5 ? "float"
                                         : "WRONG";
     std::printf("%-9s %12.3e  %s%s\n", Names[F], MaxErr, Class,
-                isKeptInDouble(F) ? "  (call kept in double by demote-fp-math)"
+                isKeptInDouble(F) ? "  (call kept in double by demote-fp)"
                                   : "");
   }
   CHECK(hipFree(DX));

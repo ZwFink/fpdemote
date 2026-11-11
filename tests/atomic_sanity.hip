@@ -1,4 +1,4 @@
-// Sanity check for demote-fp-atomics. Every check has an answer that does not
+// Sanity check for the atomics part of demote-fp. Every check has an answer that does not
 // depend on the order in which threads update the accumulator:
 //
 //   count     N threads each add 1.0 to 0. The sum is N and the returned old
@@ -16,9 +16,8 @@
 //   max       An fmax atomic, which the pass keeps in double.
 //
 // The plugin is registered from FPDEMOTE_PLUGIN and FPDEMOTE_PIPELINE. The
-// expected results are the float ones when the pipeline contains
-// demote-fp-atomics and the double ones otherwise. Exits non-zero on any
-// mismatch.
+// expected results are the float ones when the pipeline is demote-fp without
+// no-atomics and the double ones otherwise. Exits non-zero on any mismatch.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -91,7 +90,9 @@ int main() {
   if (Plugin && Pipeline)
     proteus::registerJITPassPlugin(Plugin, Pipeline,
                                    proteus::JITPassPluginPosition::Prepend);
-  bool FloatAtomics = Pipeline && std::strstr(Pipeline, "demote-fp-atomics");
+  bool FloatAtomics = Plugin && Pipeline &&
+                      std::strstr(Pipeline, "demote-fp") &&
+                      !std::strstr(Pipeline, "no-atomics");
   std::printf("expecting %s accumulation\n", FloatAtomics ? "float" : "double");
 
   const int Count = 1 << 12;
