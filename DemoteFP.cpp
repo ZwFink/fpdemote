@@ -3,13 +3,16 @@
 // operation -> fpext result; Proteus's O3 then removes the back-to-back
 // ext/trunc pairs.
 //
-// Two module passes:
-//   demote-fp       fadd/fsub/fmul/fdiv/frem/fneg/fcmp and
-//                   llvm.{sqrt,fabs,fma,fmuladd}.f64.
-//   demote-fp-math  calls to __ocml_<fn>_f64 and to the matching llvm.<fn>.f64
-//                   intrinsics become llvm.<fn>.f32 intrinsics, which the
-//                   AMDGPU backend lowers without a math library.
-// Run both with the pipeline "demote-fp,demote-fp-math".
+// One module pass, "demote-fp", with three parts that all run by default:
+//   arith    fadd/fsub/fmul/fdiv/frem/fneg/fcmp and
+//            llvm.{sqrt,fabs,fma,fmuladd}.f64.
+//   math     calls to __ocml_<fn>_f64 and to the matching llvm.<fn>.f64
+//            intrinsics become llvm.<fn>.f32 intrinsics, which the AMDGPU
+//            backend lowers without a math library.
+//   atomics  atomicrmw fadd/fsub on double becomes a cmpxchg loop that adds in
+//            float, so accumulators behave like float accumulators while
+//            memory stays double.
+// Parameters turn parts off, e.g. "demote-fp<no-math;no-atomics>".
 //
 // The plugin carries its own LLVM copy (libproteus.so hides its LLVM symbols),
 // so it must never inspect, create or fold FP constants: all casts are built
@@ -21,10 +24,11 @@
 //   QS_DEMOTE_SKIP  comma-separated substrings of function names to leave in
 //                   double, in addition to the built-in exclusions.
 //   QS_DEMOTE_MATH_SKIP  comma-separated math function names (e.g. "sin,pow")
-//                   that demote-fp-math leaves in double.
+//                   that the math part leaves in double.
 //   QS_DEMOTE_VERBOSE=1  per-function counts on stderr.
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <string>
@@ -41,6 +45,7 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
+#include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 
 using namespace llvm;
@@ -130,7 +135,7 @@ void eraseAll(SmallVectorImpl<Instruction *> &Dead) {
     I->eraseFromParent();
 }
 
-// --- demote-fp ------------------------------------------------------------
+// --- arith ----------------------------------------------------------------
 
 struct Counts {
   unsigned Arith = 0, Cmp = 0, Intr = 0;
@@ -194,42 +199,37 @@ bool demoteInstruction(Instruction &I, Counts &C) {
   return true;
 }
 
-struct DemoteFP : PassInfoMixin<DemoteFP> {
-  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-    FunctionFilter Filter;
-    bool Verbose = isVerbose();
+bool demoteArithmetic(Module &M, const FunctionFilter &Filter, bool Verbose) {
+  Counts Total;
+  unsigned Funcs = 0;
+  for (Function &F : M) {
+    if (!Filter.isSelected(F))
+      continue;
 
-    Counts Total;
-    unsigned Funcs = 0;
-    for (Function &F : M) {
-      if (!Filter.isSelected(F))
-        continue;
+    Counts C;
+    SmallVector<Instruction *, 64> Dead;
+    for (Instruction &I : instructions(F))
+      if (demoteInstruction(I, C))
+        Dead.push_back(&I);
+    eraseAll(Dead);
 
-      Counts C;
-      SmallVector<Instruction *, 64> Dead;
-      for (Instruction &I : instructions(F))
-        if (demoteInstruction(I, C))
-          Dead.push_back(&I);
-      eraseAll(Dead);
-
-      if (C.total() == 0)
-        continue;
-      ++Funcs;
-      Total.Arith += C.Arith;
-      Total.Cmp += C.Cmp;
-      Total.Intr += C.Intr;
-      if (Verbose)
-        errs() << "[DemoteFP]   " << F.getName() << ": arith=" << C.Arith
-               << " cmp=" << C.Cmp << " intr=" << C.Intr << "\n";
-    }
-    errs() << "[DemoteFP] module " << M.getName() << ": " << Funcs
-           << " functions, arith=" << Total.Arith << " cmp=" << Total.Cmp
-           << " intr=" << Total.Intr << "\n";
-    return Total.total() ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    if (C.total() == 0)
+      continue;
+    ++Funcs;
+    Total.Arith += C.Arith;
+    Total.Cmp += C.Cmp;
+    Total.Intr += C.Intr;
+    if (Verbose)
+      errs() << "[DemoteFP]   " << F.getName() << ": arith=" << C.Arith
+             << " cmp=" << C.Cmp << " intr=" << C.Intr << "\n";
   }
-};
+  errs() << "[DemoteFP] module " << M.getName() << ": " << Funcs
+         << " functions, arith=" << Total.Arith << " cmp=" << Total.Cmp
+         << " intr=" << Total.Intr << "\n";
+  return Total.total() != 0;
+}
 
-// --- demote-fp-math -------------------------------------------------------
+// --- math -----------------------------------------------------------------
 
 // Math functions whose f32 intrinsic the AMDGPU backend (LLVM 19, gfx942)
 // lowers to plain instructions, keyed by both the ocml name and the intrinsic
@@ -295,66 +295,211 @@ bool hasDemotableArguments(const CallBase &Call) {
   });
 }
 
-struct DemoteFPMath : PassInfoMixin<DemoteFPMath> {
+bool demoteMath(Module &M, const FunctionFilter &Filter, bool Verbose) {
+  std::vector<std::string> MathSkip = splitEnv("QS_DEMOTE_MATH_SKIP");
+
+  std::map<std::string, unsigned> Demoted, Kept;
+  for (Function &F : M) {
+    if (!Filter.isSelected(F))
+      continue;
+    SmallVector<Instruction *, 16> Dead;
+    for (Instruction &I : instructions(F)) {
+      auto *Call = dyn_cast<CallBase>(&I);
+      StringRef Fn = Call ? mathFunctionName(*Call) : StringRef();
+      if (Fn.empty())
+        continue;
+      std::optional<Intrinsic::ID> ID = mathIntrinsic(Fn);
+      bool Skipped = std::find(MathSkip.begin(), MathSkip.end(), Fn.str()) !=
+                     MathSkip.end();
+      if (!ID || Skipped || !hasDemotableArguments(*Call)) {
+        ++Kept[Fn.str()];
+        continue;
+      }
+      if (Verbose)
+        errs() << "[DemoteFPMath]   " << F.getName() << ": "
+               << Call->getCalledFunction()->getName() << "\n";
+      replace(I, callFloatIntrinsic(*Call, *ID));
+      Dead.push_back(&I);
+      ++Demoted[Fn.str()];
+    }
+    eraseAll(Dead);
+  }
+
+  errs() << "[DemoteFPMath] module " << M.getName() << ": demoted";
+  for (const auto &[Fn, N] : Demoted)
+    errs() << " " << Fn << "=" << N;
+  errs() << "; kept in double";
+  for (const auto &[Fn, N] : Kept)
+    errs() << " " << Fn << "=" << N;
+  errs() << "\n";
+  return !Demoted.empty();
+}
+
+// --- atomics ----------------------------------------------------
+
+std::optional<Instruction::BinaryOps> floatOpcode(const AtomicRMWInst &RMW) {
+  switch (RMW.getOperation()) {
+  case AtomicRMWInst::FAdd:
+    return Instruction::FAdd;
+  case AtomicRMWInst::FSub:
+    return Instruction::FSub;
+  default:
+    return std::nullopt;
+  }
+}
+
+bool isDoubleFPAtomic(const AtomicRMWInst &RMW) {
+  return RMW.isFloatingPointOperation() && RMW.getType()->isDoubleTy();
+}
+
+// Replaces `atomicrmw fadd ptr %p, double %v` with
+//
+//   entry: %init = load atomic i64 %p monotonic
+//   loop:  %loaded = phi i64 [%init, entry], [%current, loop]
+//          %new = fpext(fptrunc(bitcast %loaded) + fptrunc(%v))
+//          {%current, %ok} = cmpxchg %p, %loaded, bitcast %new
+//          br %ok, exit, loop
+//   exit:  result is bitcast %loaded, the value the update replaced
+//
+// The comparison is on the i64 bits, so a NaN in memory cannot loop forever.
+void expandToFloatCmpXchg(AtomicRMWInst &RMW, Instruction::BinaryOps Op) {
+  BasicBlock *Entry = RMW.getParent();
+  Function *F = Entry->getParent();
+  BasicBlock *Exit =
+      Entry->splitBasicBlock(RMW.getIterator(), "demote.atomic.exit");
+  BasicBlock *Loop =
+      BasicBlock::Create(F->getContext(), "demote.atomic.loop", F, Exit);
+  Entry->getTerminator()->eraseFromParent();
+
+  Builder B(Entry);
+  B.SetCurrentDebugLocation(RMW.getDebugLoc());
+  Type *I64 = B.getInt64Ty();
+  Value *Ptr = RMW.getPointerOperand();
+  LoadInst *Init = B.CreateAlignedLoad(I64, Ptr, RMW.getAlign(),
+                                       RMW.isVolatile(), "demote.atomic.init");
+  Init->setAtomic(AtomicOrdering::Monotonic, RMW.getSyncScopeID());
+  B.CreateBr(Loop);
+
+  B.SetInsertPoint(Loop);
+  PHINode *Loaded = B.CreatePHI(I64, 2, "demote.atomic.loaded");
+  Value *Old = B.CreateBitCast(Loaded, B.getDoubleTy());
+  Value *Sum =
+      B.CreateBinOp(Op, toFloat(B, Old), toFloat(B, RMW.getValOperand()));
+  Value *New = B.CreateBitCast(B.CreateFPExt(Sum, B.getDoubleTy()), I64);
+  AtomicCmpXchgInst *CmpXchg = B.CreateAtomicCmpXchg(
+      Ptr, Loaded, New, RMW.getAlign(), RMW.getOrdering(),
+      AtomicCmpXchgInst::getStrongestFailureOrdering(RMW.getOrdering()),
+      RMW.getSyncScopeID());
+  CmpXchg->setVolatile(RMW.isVolatile());
+  Value *Current = B.CreateExtractValue(CmpXchg, 0);
+  Value *Succeeded = B.CreateExtractValue(CmpXchg, 1);
+  B.CreateCondBr(Succeeded, Exit, Loop);
+  Loaded->addIncoming(Init, Entry);
+  Loaded->addIncoming(Current, Loop);
+
+  B.SetInsertPoint(&RMW);
+  replace(RMW, B.CreateBitCast(Loaded, B.getDoubleTy()));
+  RMW.eraseFromParent();
+}
+
+bool demoteAtomics(Module &M, const FunctionFilter &Filter, bool Verbose) {
+
+  std::map<std::string, unsigned> Demoted, Kept;
+  for (Function &F : M) {
+    if (!Filter.isSelected(F))
+      continue;
+    SmallVector<AtomicRMWInst *, 4> Atomics;
+    for (Instruction &I : instructions(F))
+      if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+        if (isDoubleFPAtomic(*RMW))
+          Atomics.push_back(RMW);
+
+    for (AtomicRMWInst *RMW : Atomics) {
+      std::string OpName =
+          AtomicRMWInst::getOperationName(RMW->getOperation()).str();
+      std::optional<Instruction::BinaryOps> Op = floatOpcode(*RMW);
+      if (!Op) {
+        ++Kept[OpName];
+        continue;
+      }
+      if (Verbose)
+        errs() << "[DemoteFPAtomics]   " << F.getName() << ": atomicrmw "
+               << OpName << "\n";
+      expandToFloatCmpXchg(*RMW, *Op);
+      ++Demoted[OpName];
+    }
+  }
+
+  errs() << "[DemoteFPAtomics] module " << M.getName() << ": demoted";
+  for (const auto &[Op, N] : Demoted)
+    errs() << " " << Op << "=" << N;
+  errs() << "; kept in double";
+  for (const auto &[Op, N] : Kept)
+    errs() << " " << Op << "=" << N;
+  errs() << "\n";
+  return !Demoted.empty();
+}
+
+// --- pass -----------------------------------------------------------------
+
+struct Parts {
+  bool Arith = true, Math = true, Atomics = true;
+};
+
+// Parses the parameters of "demote-fp<no-math;no-atomics>", given without the
+// angle brackets.
+Parts parseParts(StringRef Params) {
+  Parts P;
+  SmallVector<StringRef, 3> Names;
+  Params.split(Names, ';', -1, false);
+  for (StringRef N : Names) {
+    if (N == "no-arith")
+      P.Arith = false;
+    else if (N == "no-math")
+      P.Math = false;
+    else if (N == "no-atomics")
+      P.Atomics = false;
+    else
+      report_fatal_error("demote-fp: unknown parameter '" + N +
+                             "'; expected no-arith, no-math or no-atomics",
+                         false);
+  }
+  return P;
+}
+
+struct DemoteFP : PassInfoMixin<DemoteFP> {
+  explicit DemoteFP(Parts Enabled) : Enabled(Enabled) {}
+
+  Parts Enabled;
+
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     FunctionFilter Filter;
-    std::vector<std::string> MathSkip = splitEnv("QS_DEMOTE_MATH_SKIP");
     bool Verbose = isVerbose();
-
-    std::map<std::string, unsigned> Demoted, Kept;
-    for (Function &F : M) {
-      if (!Filter.isSelected(F))
-        continue;
-      SmallVector<Instruction *, 16> Dead;
-      for (Instruction &I : instructions(F)) {
-        auto *Call = dyn_cast<CallBase>(&I);
-        StringRef Fn = Call ? mathFunctionName(*Call) : StringRef();
-        if (Fn.empty())
-          continue;
-        std::optional<Intrinsic::ID> ID = mathIntrinsic(Fn);
-        bool Skipped = std::find(MathSkip.begin(), MathSkip.end(), Fn.str()) !=
-                       MathSkip.end();
-        if (!ID || Skipped || !hasDemotableArguments(*Call)) {
-          ++Kept[Fn.str()];
-          continue;
-        }
-        if (Verbose)
-          errs() << "[DemoteFPMath]   " << F.getName() << ": "
-                 << Call->getCalledFunction()->getName() << "\n";
-        replace(I, callFloatIntrinsic(*Call, *ID));
-        Dead.push_back(&I);
-        ++Demoted[Fn.str()];
-      }
-      eraseAll(Dead);
-    }
-
-    errs() << "[DemoteFPMath] module " << M.getName() << ": demoted";
-    for (const auto &[Fn, N] : Demoted)
-      errs() << " " << Fn << "=" << N;
-    errs() << "; kept in double";
-    for (const auto &[Fn, N] : Kept)
-      errs() << " " << Fn << "=" << N;
-    errs() << "\n";
-    return Demoted.empty() ? PreservedAnalyses::all()
-                           : PreservedAnalyses::none();
+    bool Changed = false;
+    if (Enabled.Arith)
+      Changed |= demoteArithmetic(M, Filter, Verbose);
+    if (Enabled.Math)
+      Changed |= demoteMath(M, Filter, Verbose);
+    if (Enabled.Atomics)
+      Changed |= demoteAtomics(M, Filter, Verbose);
+    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 } // namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "DemoteFP", "0.2", [](PassBuilder &PB) {
-            PB.registerPipelineParsingCallback(
-                [](StringRef Name, ModulePassManager &MPM,
-                   ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name == "demote-fp") {
-                    MPM.addPass(DemoteFP());
-                    return true;
-                  }
-                  if (Name == "demote-fp-math") {
-                    MPM.addPass(DemoteFPMath());
-                    return true;
-                  }
-                  return false;
-                });
-          }};
+  return {
+      LLVM_PLUGIN_API_VERSION, "DemoteFP", "0.4", [](PassBuilder &PB) {
+        PB.registerPipelineParsingCallback(
+            [](StringRef Name, ModulePassManager &MPM,
+               ArrayRef<PassBuilder::PipelineElement>) {
+              if (!PassBuilder::checkParametrizedPassName(Name, "demote-fp"))
+                return false;
+              StringRef Params = Name.drop_front(strlen("demote-fp"));
+              Params.consume_front("<");
+              Params.consume_back(">");
+              MPM.addPass(DemoteFP(parseParts(Params)));
+              return true;
+            });
+      }};
 }
