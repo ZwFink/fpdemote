@@ -3,13 +3,16 @@
 // operation -> fpext result; Proteus's O3 then removes the back-to-back
 // ext/trunc pairs.
 //
-// Two module passes:
+// Three module passes:
 //   demote-fp       fadd/fsub/fmul/fdiv/frem/fneg/fcmp and
 //                   llvm.{sqrt,fabs,fma,fmuladd}.f64.
 //   demote-fp-math  calls to __ocml_<fn>_f64 and to the matching llvm.<fn>.f64
 //                   intrinsics become llvm.<fn>.f32 intrinsics, which the
 //                   AMDGPU backend lowers without a math library.
-// Run both with the pipeline "demote-fp,demote-fp-math".
+//   demote-fp-atomics  atomicrmw fadd/fsub on double becomes a cmpxchg loop
+//                   that adds in float, so accumulators behave like float
+//                   accumulators while memory stays double.
+// Run all three with the pipeline "demote-fp,demote-fp-math,demote-fp-atomics".
 //
 // The plugin carries its own LLVM copy (libproteus.so hides its LLVM symbols),
 // so it must never inspect, create or fold FP constants: all casts are built
@@ -339,10 +342,120 @@ struct DemoteFPMath : PassInfoMixin<DemoteFPMath> {
                            : PreservedAnalyses::none();
   }
 };
+
+// --- demote-fp-atomics ----------------------------------------------------
+
+std::optional<Instruction::BinaryOps> floatOpcode(const AtomicRMWInst &RMW) {
+  switch (RMW.getOperation()) {
+  case AtomicRMWInst::FAdd:
+    return Instruction::FAdd;
+  case AtomicRMWInst::FSub:
+    return Instruction::FSub;
+  default:
+    return std::nullopt;
+  }
+}
+
+bool isDoubleFPAtomic(const AtomicRMWInst &RMW) {
+  return RMW.isFloatingPointOperation() && RMW.getType()->isDoubleTy();
+}
+
+// Replaces `atomicrmw fadd ptr %p, double %v` with
+//
+//   entry: %init = load atomic i64 %p monotonic
+//   loop:  %loaded = phi i64 [%init, entry], [%current, loop]
+//          %new = fpext(fptrunc(bitcast %loaded) + fptrunc(%v))
+//          {%current, %ok} = cmpxchg %p, %loaded, bitcast %new
+//          br %ok, exit, loop
+//   exit:  result is bitcast %loaded, the value the update replaced
+//
+// The comparison is on the i64 bits, so a NaN in memory cannot loop forever.
+void expandToFloatCmpXchg(AtomicRMWInst &RMW, Instruction::BinaryOps Op) {
+  BasicBlock *Entry = RMW.getParent();
+  Function *F = Entry->getParent();
+  BasicBlock *Exit =
+      Entry->splitBasicBlock(RMW.getIterator(), "demote.atomic.exit");
+  BasicBlock *Loop =
+      BasicBlock::Create(F->getContext(), "demote.atomic.loop", F, Exit);
+  Entry->getTerminator()->eraseFromParent();
+
+  Builder B(Entry);
+  B.SetCurrentDebugLocation(RMW.getDebugLoc());
+  Type *I64 = B.getInt64Ty();
+  Value *Ptr = RMW.getPointerOperand();
+  LoadInst *Init = B.CreateAlignedLoad(I64, Ptr, RMW.getAlign(),
+                                       RMW.isVolatile(), "demote.atomic.init");
+  Init->setAtomic(AtomicOrdering::Monotonic, RMW.getSyncScopeID());
+  B.CreateBr(Loop);
+
+  B.SetInsertPoint(Loop);
+  PHINode *Loaded = B.CreatePHI(I64, 2, "demote.atomic.loaded");
+  Value *Old = B.CreateBitCast(Loaded, B.getDoubleTy());
+  Value *Sum =
+      B.CreateBinOp(Op, toFloat(B, Old), toFloat(B, RMW.getValOperand()));
+  Value *New = B.CreateBitCast(B.CreateFPExt(Sum, B.getDoubleTy()), I64);
+  AtomicCmpXchgInst *CmpXchg = B.CreateAtomicCmpXchg(
+      Ptr, Loaded, New, RMW.getAlign(), RMW.getOrdering(),
+      AtomicCmpXchgInst::getStrongestFailureOrdering(RMW.getOrdering()),
+      RMW.getSyncScopeID());
+  CmpXchg->setVolatile(RMW.isVolatile());
+  Value *Current = B.CreateExtractValue(CmpXchg, 0);
+  Value *Succeeded = B.CreateExtractValue(CmpXchg, 1);
+  B.CreateCondBr(Succeeded, Exit, Loop);
+  Loaded->addIncoming(Init, Entry);
+  Loaded->addIncoming(Current, Loop);
+
+  B.SetInsertPoint(&RMW);
+  replace(RMW, B.CreateBitCast(Loaded, B.getDoubleTy()));
+  RMW.eraseFromParent();
+}
+
+struct DemoteFPAtomics : PassInfoMixin<DemoteFPAtomics> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    FunctionFilter Filter;
+    bool Verbose = isVerbose();
+
+    std::map<std::string, unsigned> Demoted, Kept;
+    for (Function &F : M) {
+      if (!Filter.isSelected(F))
+        continue;
+      SmallVector<AtomicRMWInst *, 4> Atomics;
+      for (Instruction &I : instructions(F))
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          if (isDoubleFPAtomic(*RMW))
+            Atomics.push_back(RMW);
+
+      for (AtomicRMWInst *RMW : Atomics) {
+        std::string OpName =
+            AtomicRMWInst::getOperationName(RMW->getOperation()).str();
+        std::optional<Instruction::BinaryOps> Op = floatOpcode(*RMW);
+        if (!Op) {
+          ++Kept[OpName];
+          continue;
+        }
+        if (Verbose)
+          errs() << "[DemoteFPAtomics]   " << F.getName() << ": atomicrmw "
+                 << OpName << "\n";
+        expandToFloatCmpXchg(*RMW, *Op);
+        ++Demoted[OpName];
+      }
+    }
+
+    errs() << "[DemoteFPAtomics] module " << M.getName() << ": demoted";
+    for (const auto &[Op, N] : Demoted)
+      errs() << " " << Op << "=" << N;
+    errs() << "; kept in double";
+    for (const auto &[Op, N] : Kept)
+      errs() << " " << Op << "=" << N;
+    errs() << "\n";
+    return Demoted.empty() ? PreservedAnalyses::all()
+                           : PreservedAnalyses::none();
+  }
+};
 } // namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "DemoteFP", "0.2", [](PassBuilder &PB) {
+  return {LLVM_PLUGIN_API_VERSION, "DemoteFP", "0.3", [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
@@ -352,6 +465,10 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
                   }
                   if (Name == "demote-fp-math") {
                     MPM.addPass(DemoteFPMath());
+                    return true;
+                  }
+                  if (Name == "demote-fp-atomics") {
+                    MPM.addPass(DemoteFPAtomics());
                     return true;
                   }
                   return false;

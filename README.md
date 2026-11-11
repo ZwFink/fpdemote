@@ -11,14 +11,16 @@ fptrunc operands to float -> float operation -> fpext result to double
 
 Loads, stores and function signatures stay in `double`. Proteus's O3 pipeline
 then removes the back-to-back `fpext`/`fptrunc` pairs between chained
-operations.
+operations. Atomic accumulation is the exception to this shape; see
+[Atomics](#atomics).
 
-The plugin provides two module passes, which can be used alone or together:
+The plugin provides three module passes, which can be used alone or together:
 
 | Pass | Demotes |
 |---|---|
 | `demote-fp` | `fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fneg`, `fcmp`, and `llvm.{sqrt,fabs,fma,fmuladd}.f64` |
 | `demote-fp-math` | calls to the AMD math library (`__ocml_<fn>_f64`) and the matching `llvm.<fn>.f64` intrinsics, replaced by `llvm.<fn>.f32` intrinsics |
+| `demote-fp-atomics` | `atomicrmw fadd` and `fsub` on `double`, replaced by a `cmpxchg` loop that adds in `float` |
 
 ## Building
 
@@ -43,13 +45,13 @@ happened yet and per-function selection by name still works:
 #include <proteus/Init.h>
 
 proteus::registerJITPassPlugin("/path/to/libDemoteFP.so",
-                               "demote-fp,demote-fp-math",
+                               "demote-fp,demote-fp-math,demote-fp-atomics",
                                proteus::JITPassPluginPosition::Prepend);
 ```
 
-The pipeline string selects the passes: `demote-fp` for arithmetic only,
-`demote-fp-math` for math functions only, or `demote-fp,demote-fp-math` for
-both.
+The pipeline string selects the passes, in any combination: `demote-fp` for
+arithmetic, `demote-fp-math` for math functions and `demote-fp-atomics` for
+atomic accumulation.
 
 Proteus must run its plugin-capable code generation path:
 
@@ -76,7 +78,9 @@ stream is unchanged.
 instruction or call. For math calls this is usually HIP's header wrapper, such
 as `_ZL3logd` for `log(double)`, not the application function that calls
 `log`, because nothing is inlined at `Prepend`. To choose which math functions
-are demoted, use `QS_DEMOTE_MATH_SKIP`.
+are demoted, use `QS_DEMOTE_MATH_SKIP`. Likewise, HIP's `atomicAdd(double *,
+double)` is the wrapper `_Z9atomicAddPdd`, so a `double` `atomicAdd` anywhere in
+the module is selected or skipped by that name.
 
 Each pass prints a summary line per module:
 
@@ -112,6 +116,30 @@ double":
 `v_sin_f32` and `v_cos_f32` do no full range reduction, so their error grows
 with `|x|`. The sanity test below only covers `x` in `(0.1, 2π)`.
 
+## Atomics
+
+An atomic add happens in memory, so the operand-truncation shape above cannot
+make the accumulator itself `float`: it would only round the added value. Instead
+`demote-fp-atomics` replaces each `atomicrmw fadd` or `fsub` on `double` with a
+compare-and-swap loop:
+
+```
+loop: old = load double
+      new = fpext(fptrunc(old) + fptrunc(val))
+      cmpxchg ptr, old, new   ; on the i64 bits, retried until it succeeds
+```
+
+The value in memory stays `double` but is always the `float`-rounded sum, so
+the accumulator behaves exactly like a `float` accumulator that started from
+the same value. The atomic's ordering, sync scope, alignment and volatility
+carry over to the `cmpxchg`, and it still returns the value it replaced.
+Other floating-point atomics (`fmax`, `fmin`) are left in `double` and listed
+under "kept in double".
+
+The loop is much slower than a hardware atomic when many threads update one
+address, since every thread that loses the race retries. Updates spread over
+many addresses, such as Quicksilver's tallies, are unaffected in practice.
+
 ## Testing
 
 `tests/run_math_sanity.sh` builds a small Proteus HIP program that evaluates
@@ -128,6 +156,13 @@ pass keeps in `double` should report `double`, and nothing should report
 `WRONG`. Rounding functions report `double` because their inputs are chosen
 away from integers, so rounding the input to `float` does not change the
 result.
+
+`tests/run_atomic_sanity.sh` takes the same arguments and checks
+`demote-fp-atomics` with results that do not depend on thread order: thousands
+of threads add 1.0 to one value, which must lose no update and return each old
+value exactly once; adding 1.0 to 2^24 and subtracting 1.0 from 2^25 must
+leave the value unchanged in `float` and move it in `double`; and an `fmax`
+atomic must stay in `double`. Each run exits non-zero on a mismatch.
 
 ## Why the plugin links its own LLVM
 
@@ -168,3 +203,12 @@ These are sanity checks of the implementation, not a fidelity study. At 1M
 particles `demote-fp` alone changes tallies by 10–20× less than seed-to-seed
 noise. There is no speedup from `demote-fp` on MI300A, where unpacked FP64 and
 FP32 VALU throughput are equal; `demote-fp-math` has not been timed.
+
+`demote-fp-atomics` rewrites Quicksilver's one `double` atomic, the scalar
+flux tally in `MC_Segment_Outcome`, and does not change the particle counts.
+With 200,000 particles, adding it to `demote-fp,demote-fp-math` changes
+individual flux bins by about 5e-8 (median) with the default 230 energy groups
+and about 1e-6 with 4 groups, and the summed flux by 3e-9 and 2e-7. The rest of
+the demotion changes the summed flux by 1e-6 to 2e-5. Bins are summed in
+`double` on the host, so per-bin rounding errors mostly cancel. Run time did
+not change measurably.
